@@ -1,0 +1,313 @@
+---
+title: "MM_2019_W01"
+author: "Pratik C"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, 
+                      fig.width = 12, fig.height = 12,
+                      echo = TRUE, eval = TRUE)
+options(warn = 1)
+```
+
+## Set environment
+```{r}
+# Load libraries
+library(tidyverse)
+library(hrbrthemes)
+library(ggpmisc)
+library(ggtext)
+library(ggalt)
+library(ggforce)
+library(ggrepel)
+library(ggfittext)
+library(patchwork)
+library(rvest)
+library(lubridate)
+library(sf)
+library(osmdata)
+library(mapview)
+library(sfnetworks)
+library(tidygraph)
+library(scales)
+
+# Load themes script
+source(file = "C:\\Stuff\\Datasets\\vaw_themes.R")
+
+# Set working directory
+setwd("C:\\Stuff\\Datasets\\isochron-indianrailways/")
+```
+
+## Functions
+```{r}
+
+```
+
+## Load data
+```{r}
+# Create BB for Kolkata
+ymax <- 22.994
+ymin <- 22.953
+xmax <- 88.477
+xmin <- 88.417
+# Create bounding box
+bbox <- c(xmin = xmin, ymin = ymin,
+          xmax = xmax, ymax = ymax)
+
+# Get main roads
+feat_major_road <- opq(bbox = bbox, timeout = 100) %>%
+  add_osm_feature(key = "highway",
+                  value = c("motorway", "motorway_link",
+                            "trunk", "trunk_link",
+                            "primary", "primary_link",
+                            "secondary", "secondary_link",
+                            "tertiary", "tertiary_link",
+                            "unclassified", "residential")) %>%
+  osmdata_sf()
+# # Save
+write_rds(x = feat_major_road, file = "kalyani_road.rds")
+# feat_major_road <- read_rds(file = "kolkata_roads.rds")
+```
+
+## Process data
+```{r}
+# Create bounding box polygon ----------------
+bbox_polygon <- st_bbox(obj = bbox, 
+                     crs = st_crs(feat_major_road$osm_lines)) %>% 
+  # Convert to sf
+  st_as_sfc()
+
+# Create SF network object from road geometries -----------------------
+# First, round off coords to 4th decimal, to increase connectivity
+shp_major_road <- feat_major_road$osm_lines %>% 
+  # Filter road network to raods within boox
+  st_filter(y = bbox_polygon, .predicate = st_intersects) %>% 
+  # Remove extra columns
+  select(osm_id, name, highway) %>% 
+  # Round precision to 3 decimals
+  st_set_geometry(value = st_geometry(.) %>% 
+                    lapply(FUN = function(x) round(x, 4)) %>% 
+                    st_sfc(crs = st_crs(x = feat_major_road$osm_lines))) %>% 
+  # Set speeds
+  mutate(speed = case_when(str_detect(string = highway, pattern = "motorway|trunk") ~ 60L,
+                           str_detect(string = highway, pattern = "primary") ~ 50L,
+                           str_detect(string = highway, pattern = "secondary") ~ 40L,
+                           str_detect(string = highway, pattern = "tertiary") ~ 30L,
+                           TRUE ~ 20L))
+
+ggplot(data = shp_major_road) + 
+  geom_sf() + 
+  geom_sf(data = bbox_polygon, mapping = aes(geometry = geometry),
+          color = "blue", fill = NA)
+
+# Convert to network ------------------------------
+sfnet_road <- as_sfnetwork(x = shp_major_road, directed = TRUE) %>% 
+  # Remove multiple edges
+  activate(what = "edges") %>% 
+  mutate(edge_dist = edge_length() %>% as.numeric(),
+         # Calculate time
+         # edge_time = edge_dist/((5/18) * speed)
+         edge_time = edge_dist) %>% 
+  # arrange by time taken to traverse
+  arrange(edge_time) %>% 
+  # Remove loops and MEs
+  filter(!edge_is_multiple()) %>% 
+  filter(!edge_is_loop()) %>% 
+  # Remove extra columns
+  select(-c(highway, speed, edge_dist, name, osm_id)) %>% 
+  activate(what = "nodes") %>% 
+  # Smooth network
+  convert(.f = to_spatial_smooth, store_original_data = TRUE, .clean = TRUE) %>% 
+  # Sum up weights for combined
+  activate(what = "edges") %>% 
+  mutate(edge_time_alt = map_dbl(.x = .orig_data, 
+                                 .f = function(x){
+                                   x %>% 
+                                     # Covnert to tibble
+                                     as_tibble() %>% 
+                                     # Select weight column
+                                     select(edge_time) %>% 
+                                     sum()
+                                 })) %>% 
+  # If original is blank replace with alt
+  mutate(edge_time = case_when(is.na(edge_time) ~ edge_time_alt,
+                               TRUE ~ edge_time)) %>% 
+  # Remove extra columns
+  select(-c(.orig_data, edge_time_alt)) %>% 
+  # Subdivude edges
+  convert(.f = to_spatial_subdivision, .clean = TRUE)
+
+# To simplify, first find clusters
+node_clusters <- dbscan::dbscan(x = sfnet_road %>% 
+                                  # Extract node coordinates
+                                  activate(what = "nodes") %>% 
+                                  st_coordinates(),
+                                # Set distance to 0.0001
+                                eps = 0.0001, minPts = 1)$cluster
+# Add cluster info to network
+sfnet_road <- sfnet_road %>% 
+  activate(what = "nodes") %>% 
+  mutate(cluster = node_clusters) %>% 
+  # Contract
+  convert(.f = to_spatial_contracted, cluster, 
+          simplify = TRUE, .clean = TRUE) %>% 
+  # Extract first component
+  filter(group_components() == 1)
+
+# Define PoI ----------------
+shp_poi <- st_sfc(st_point(x = c(88.4547, 22.9640)), 
+                  crs = st_crs(shp_major_road)) %>% 
+  st_as_sf()
+
+# Create geometry of all points in plane -------------------------
+# First latitude, since its constant
+diff_y <- 0.01/111.321
+# Y distance will depend on coordinate
+diff_x <- 0.01/(111.321 * cos(abs(mean(c(ymax, ymin))) * pi/180))
+
+shp_plane <- tibble(x = seq(from = xmin, to = xmax, by = diff_x),
+                     y = list(seq(from = ymin, to = ymax, by = diff_y))) %>% 
+  # Long form
+  unnest_longer(col = y) %>% 
+  # Add index
+  mutate(index = row_number(),
+         # Store coords in another columns
+         x_geo = x, y_geo = y) %>% 
+  # Convert to sf
+  st_as_sf(coords = c("x_geo", "y_geo"), crs = st_crs(shp_major_road), 
+           agr = "identity", remove = FALSE) %>% 
+  # Add column to mark as plane points
+  mutate(type = "plane") %>% 
+  # Remove extra columns
+  select(index, type, x, y) %>% 
+  # Get nearest node in network to each point
+  mutate(near_node = st_nearest_feature(x = ., y = sfnet_road))
+
+# Extract unique network nodes ---------------------------------
+shp_plane_network_node <- sfnet_road %>% 
+  # Filter nodes that map to plane points
+  activate(what = "nodes") %>% 
+  # Conver to sf
+  st_as_sf() %>% 
+  # Set node index
+  mutate(node_index = row_number()) %>% 
+  # Unlist the index column
+  filter(node_index %in% unique(shp_plane$near_node))
+
+# Add column to store distance of plane point from nearest node ---------------
+shp_plane$extra_dist <- shp_plane %>% 
+  # Sort
+  arrange(index) %>% 
+  # Calculate
+  st_distance(y = shp_plane_network_node %>% 
+                select(node_index) %>% 
+                # Map corresponding points on plane
+                right_join(y = shp_plane %>% 
+                             as_tibble() %>% 
+                             select(index, near_node),
+                           by = c("node_index" = "near_node")) %>% 
+                # Arranmge in order of index
+                arrange(index),
+              by_element = TRUE) %>% 
+  as.integer()
+
+# Calculate Origin Destination matrix -------------------------------
+t0 <- Sys.time()
+data_dist <- st_network_cost(x = sfnet_road, 
+                             to = shp_poi, 
+                             from = shp_plane_network_node, weights = "edge_time") %>% 
+  # Convert to tibble
+  as_tibble() %>% 
+  rename(dist = 1) %>% 
+  # Column for index
+  mutate(near_node = shp_plane_network_node$node_index[row_number()]) %>% 
+  # Get all plane nodes mapped to network mode
+  left_join(y = shp_plane,
+            by = "near_node") %>% 
+  # Total dist
+  mutate(total_dist = dist + (extra_dist/((0.1) * 10))) %>% 
+  # Keep columns
+  select(x, y, dist, total_dist)
+difftime(time1 = Sys.time(), time2 = t0)
+
+```
+
+## Visualize
+```{r}
+# Set scale fill type
+fill_scale <- "Quantile"
+# Set breaks for scale
+legend_breaks <- case_when(
+    fill_scale == "Linear" ~ seq.int(from = min(data_dist$total_dist),
+                                     to = max(data_dist$total_dist),
+                                     length.out = 13) %>% as.integer(),
+    fill_scale == "Quantile" ~ quantile(x = data_dist$total_dist, 
+                                        c(seq(from = 0, 
+                                            to = 0.9, 
+                                            by = 0.1), 
+                                          c(0.96, 0.99, 1))) %>% as.integer())
+# legend_breaks <- c(60, 120, 300, 600, 900, 1200, 1800, 2400, 3000, 3600, max(data_dist$total_dist))
+legend_breaks <- c(250, 500, 1000, 2000, 5000, 10000, max(data_dist$total_dist))
+
+# Plot raster
+plot_map <- ggplot() + 
+  geom_raster(data = data_dist,
+              mapping = aes(x = x, y = y, fill = total_dist)) +
+  # Overlay road grid
+  geom_sf(data = shp_major_road, mapping = aes(geometry = geometry, 
+                                               size = as.factor(speed)),
+          colour = "grey80", alpha = 0.7) +
+  # Scales
+  scale_x_continuous(name = NULL,
+                       breaks = NULL,
+                       expand = expansion(mult = c(0.05, 0.05))) +
+  scale_y_continuous(name = NULL,
+                       breaks = NULL,
+                       expand = expansion(mult = c(0.05, 0.05))) +
+  binned_scale(aesthetics = "fill", 
+               scale_name = "stepsn", 
+               palette = function(x) viridisLite::inferno(n = length(legend_breaks) - 1, 
+                                                          begin = 1, 
+                                                          end = 0),
+               breaks = legend_breaks,
+               limits = range(data_dist$total_dist),
+               labels = comma_format(accuracy = 1),
+               name = "Distance in metres",
+               show.limits = TRUE,
+               guide = guide_legend(nrow = 3, override.aes = list(colour = "white")),
+               # guide = NULL
+               ) +
+  # Scale for size
+  scale_size_manual(breaks = c("60", "50", "40", "30", "20"), 
+                    values = c(2, 1.6, 1.2, 0.8, 0.5),
+                    guide = NULL) +
+  # Frame limits
+  coord_sf(xlim = c(xmin, xmax),
+           ylim = c(ymin, ymax),
+           expand = expansion(mult = c(0.0, 0.0))) +
+  labs(title = "How Far Is (Insert place) Again?", 
+  subtitle = "Distance of points in Kalyani from home", 
+  caption = "Data: OpenStreetMap Contribtors\nDesign: @JediPro") +
+  theme_vaw_dark() +
+  theme(panel.grid.major = element_blank(),
+        panel.background = element_rect(fill = NA, colour = "black", size = 0.5),
+        strip.text = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.title = element_text(colour = "white"),
+        legend.text = element_text(colour = "white"),
+        legend.key.width = unit(9, "mm"),
+        legend.position = c(0.2, 0.05),
+        legend.direction = "horizontal"
+        )
+
+# Save
+t0 <- Sys.time()
+ggsave(filename = "kalyani_isodist.png", 
+       plot = plot_map, device = "png", 
+       width = 32, height = 25, units = "cm", dpi = 300, limitsize = FALSE)
+print(Sys.time() - t0)
+```
+
