@@ -27,7 +27,7 @@ library(rvest)
 library(lubridate)
 library(sf)
 library(osmdata)
-library(mapview)
+library(mapview)x
 library(sfnetworks)
 library(tidygraph)
 library(scales)
@@ -56,18 +56,18 @@ bbox <- c(xmin = xmin, ymin = ymin,
           xmax = xmax, ymax = ymax)
 
 # Get main roads
-feat_major_road <- opq(bbox = bbox, timeout = 100) %>%
-  add_osm_feature(key = "highway",
-                  value = c("motorway", "motorway_link",
-                            "trunk", "trunk_link",
-                            "primary", "primary_link",
-                            "secondary", "secondary_link",
-                            "tertiary", "tertiary_link",
-                            "unclassified", "residential")) %>%
-  osmdata_sf()
+# feat_major_road <- opq(bbox = bbox, timeout = 100) %>%
+#   add_osm_feature(key = "highway",
+#                   value = c("motorway", "motorway_link",
+#                             "trunk", "trunk_link",
+#                             "primary", "primary_link",
+#                             "secondary", "secondary_link",
+#                             "tertiary", "tertiary_link",
+#                             "unclassified", "residential")) %>%
+#   osmdata_sf()
 # # Save
-write_rds(x = feat_major_road, file = "kalyani_road.rds")
-# feat_major_road <- read_rds(file = "kolkata_roads.rds")
+# write_rds(x = feat_major_road, file = "kalyani_road.rds")
+feat_major_road <- read_rds(file = "kalyani_roads.rds")
 ```
 
 ## Process data
@@ -102,25 +102,23 @@ ggplot(data = shp_major_road) +
           color = "blue", fill = NA)
 
 # Convert to network ------------------------------
-sfnet_road <- as_sfnetwork(x = shp_major_road, directed = TRUE) %>% 
-  # Remove multiple edges
+sfnet_road <- as_sfnetwork(x = shp_major_road, directed = FALSE) %>% 
+  # Subdivude edges
+  convert(.f = to_spatial_subdivision, .clean = TRUE) %>% 
+  # Sum up weights for combined
   activate(what = "edges") %>% 
+  # Calculate time to cross edge
   mutate(edge_dist = edge_length() %>% as.numeric(),
          # Calculate time
-         # edge_time = edge_dist/((5/18) * speed)
-         edge_time = edge_dist) %>% 
-  # arrange by time taken to traverse
-  arrange(edge_time) %>% 
-  # Remove loops and MEs
-  filter(!edge_is_multiple()) %>% 
-  filter(!edge_is_loop()) %>% 
-  # Remove extra columns
-  select(-c(highway, speed, edge_dist, name, osm_id)) %>% 
+         edge_time = edge_dist/((5/18) * speed)
+         # edge_time = edge_dist
+         ) %>% 
   activate(what = "nodes") %>% 
   # Smooth network
   convert(.f = to_spatial_smooth, store_original_data = TRUE, .clean = TRUE) %>% 
-  # Sum up weights for combined
+  # Back to edges
   activate(what = "edges") %>% 
+  # Replace attributes with old ones
   mutate(edge_time_alt = map_dbl(.x = .orig_data, 
                                  .f = function(x){
                                    x %>% 
@@ -135,8 +133,8 @@ sfnet_road <- as_sfnetwork(x = shp_major_road, directed = TRUE) %>%
                                TRUE ~ edge_time)) %>% 
   # Remove extra columns
   select(-c(.orig_data, edge_time_alt)) %>% 
-  # Subdivude edges
-  convert(.f = to_spatial_subdivision, .clean = TRUE)
+  # remove multiple edges and loops
+  filter(!(is.na(edge_is_loop()) | is.na(edge_is_multiple())))
 
 # To simplify, first find clusters
 node_clusters <- dbscan::dbscan(x = sfnet_road %>% 
@@ -154,6 +152,9 @@ sfnet_road <- sfnet_road %>%
           simplify = TRUE, .clean = TRUE) %>% 
   # Extract first component
   filter(group_components() == 1)
+
+net_edges <- sfnet_road %>% activate("edges") %>% st_as_sf()
+net_nodes <- sfnet_road %>% activate("nodes") %>% st_as_sf()
 
 # Define PoI ----------------
 shp_poi <- st_sfc(st_point(x = c(88.4547, 22.9640)), 
@@ -222,13 +223,18 @@ data_dist <- st_network_cost(x = sfnet_road,
   rename(dist = 1) %>% 
   # Column for index
   mutate(near_node = shp_plane_network_node$node_index[row_number()]) %>% 
+  # Get geometry of nearest nodes
+  # left_join(y = shp_plane_network_node,
+  #           by = c("near_node" = "node_index"))
   # Get all plane nodes mapped to network mode
   left_join(y = shp_plane,
             by = "near_node") %>% 
   # Total dist
-  mutate(total_dist = dist + (extra_dist/((0.1) * 10))) %>% 
+  mutate(total_dist = dist + (extra_dist/((5/18) * 10))) %>% 
   # Keep columns
-  select(x, y, dist, total_dist)
+  select(x, y, dist, total_dist) %>% 
+  # Time in minutes
+  mutate(total_dist = total_dist/60)
 difftime(time1 = Sys.time(), time2 = t0)
 
 ```
@@ -247,8 +253,7 @@ legend_breaks <- case_when(
                                             to = 0.9, 
                                             by = 0.1), 
                                           c(0.96, 0.99, 1))) %>% as.integer())
-# legend_breaks <- c(60, 120, 300, 600, 900, 1200, 1800, 2400, 3000, 3600, max(data_dist$total_dist))
-legend_breaks <- c(250, 500, 1000, 2000, 5000, 10000, max(data_dist$total_dist))
+legend_breaks <- c(1, 2, 3, 4, 5, 6, 8, 10, 12, max(data_dist$total_dist))
 
 # Plot raster
 plot_map <- ggplot() + 
@@ -265,19 +270,17 @@ plot_map <- ggplot() +
   scale_y_continuous(name = NULL,
                        breaks = NULL,
                        expand = expansion(mult = c(0.05, 0.05))) +
-  binned_scale(aesthetics = "fill", 
-               scale_name = "stepsn", 
-               palette = function(x) viridisLite::inferno(n = length(legend_breaks) - 1, 
-                                                          begin = 1, 
+  binned_scale(aesthetics = "fill",
+               scale_name = "stepsn",
+               palette = function(x) viridisLite::inferno(n = length(legend_breaks) - 1,
+                                                          begin = 1,
                                                           end = 0),
                breaks = legend_breaks,
                limits = range(data_dist$total_dist),
                labels = comma_format(accuracy = 1),
-               name = "Distance in metres",
+               name = "Time in minutes",
                show.limits = TRUE,
-               guide = guide_legend(nrow = 3, override.aes = list(colour = "white")),
-               # guide = NULL
-               ) +
+               guide = guide_legend(nrow = 4, title.position = "top", title.hjust = 0.5)) +
   # Scale for size
   scale_size_manual(breaks = c("60", "50", "40", "30", "20"), 
                     values = c(2, 1.6, 1.2, 0.8, 0.5),
@@ -287,7 +290,7 @@ plot_map <- ggplot() +
            ylim = c(ymin, ymax),
            expand = expansion(mult = c(0.0, 0.0))) +
   labs(title = "How Far Is (Insert place) Again?", 
-  subtitle = "Distance of points in Kalyani from home", 
+  subtitle = "Time taken to reach a point in Kalyani from home", 
   caption = "Data: OpenStreetMap Contribtors\nDesign: @JediPro") +
   theme_vaw_dark() +
   theme(panel.grid.major = element_blank(),
@@ -299,7 +302,8 @@ plot_map <- ggplot() +
         legend.title = element_text(colour = "white"),
         legend.text = element_text(colour = "white"),
         legend.key.width = unit(9, "mm"),
-        legend.position = c(0.2, 0.05),
+        legend.key = element_rect(colour = "white"),
+        legend.position = c(0.9, 0.9),
         legend.direction = "horizontal"
         )
 
